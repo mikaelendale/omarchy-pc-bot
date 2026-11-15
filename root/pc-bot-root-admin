@@ -1,0 +1,75 @@
+#!/usr/bin/python3 -I
+"""pc-bot-root-admin: turn remote root back on, or show its state.
+
+Installed root-owned at /usr/local/lib/pc-bot/pc-bot-root-admin and NOT in the
+password-free sudo rule, so it always needs your real sudo password:
+
+  sudo /usr/local/lib/pc-bot/pc-bot-root-admin status
+  sudo /usr/local/lib/pc-bot/pc-bot-root-admin enable     (pc-bot unlock runs this)
+
+It shares pc-bot-root's lock and writes the state the same way (atomically).
+"""
+
+import fcntl
+import json
+import os
+import sys
+import syslog
+import time
+
+STATE_DIR = "/var/lib/pc-bot"
+STATE = os.path.join(STATE_DIR, "root-state.json")
+LOCK = os.path.join(STATE_DIR, "root.lock")
+
+
+def save(d):
+    tmp = STATE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        view = memoryview(json.dumps(d).encode())
+        while view:
+            n = os.write(fd, view)
+            if n <= 0:
+                raise OSError("short write")
+            view = view[n:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, STATE)
+
+
+def main():
+    if os.geteuid() != 0:
+        sys.exit("Run it with sudo.")
+    action = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if action not in ("status", "enable"):
+        sys.exit("Usage: pc-bot-root-admin status|enable")
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    lock = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        with open(STATE) as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            raise ValueError
+    except (OSError, ValueError):
+        # Unreadable: start clean, but keep codes from right now unusable.
+        d = {"last_step": int(time.time()) // 30 + 1, "fails": 0, "disabled": True}
+    if action == "enable":
+        d["disabled"] = False
+        d["fails"] = 0
+        d.setdefault("last_step", int(time.time()) // 30 + 1)
+        d.pop("disabled_why", None)
+        d.pop("disabled_at", None)
+        save(d)
+        syslog.openlog("pc-bot-root", 0, syslog.LOG_AUTHPRIV)
+        syslog.syslog(syslog.LOG_NOTICE, f"remote root turned back ON by {os.environ.get('SUDO_USER', 'root')}")
+        print("Remote root is on again.")
+    else:
+        on = not d.get("disabled")
+        print(f"Remote root: {'on' if on else 'OFF (' + d.get('disabled_why', 'turned off') + ')'}")
+        print(f"Wrong codes in a row: {d.get('fails', 0)}")
+
+
+if __name__ == "__main__":
+    main()

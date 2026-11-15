@@ -1,0 +1,357 @@
+#!/usr/bin/python3 -I
+"""pc-bot-root: runs one root command for pc-bot, but only with a valid
+authenticator code.
+
+Installed root-owned at /usr/local/lib/pc-bot/pc-bot-root. A sudoers rule lets
+your user run it without a password, with no arguments: it reads one JSON
+request on stdin and prints one JSON answer.
+
+  {"action": "run",      "code": "123456", "command": "...", "timeout": 300}
+  {"action": "verify",   "code": "123456"}     check a code (pc-bot's trusted session)
+  {"action": "status"}                         locked? disabled? no code needed
+  {"action": "lockdown"}                       turn remote root off; no code needed
+
+Why it's safe to allow without a password:
+- The secret behind the codes (/etc/pc-bot/totp.key) is readable by root only,
+  so neither the bot nor anything running as you can make a valid code.
+- Every code works once (replays are refused).
+- Five wrong codes in a row, or a lockdown, turn it off completely. Only
+  pc-bot-root-admin, which needs your real sudo password, turns it back on.
+- Every attempt and every command is written to the system journal
+  (journalctl -t pc-bot-root).
+"""
+
+import base64
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import resource
+import select
+import signal
+import struct
+import subprocess
+import sys
+import syslog
+import time
+
+TEST = os.environ.get("PC_BOT_ROOT_TEST") if os.geteuid() != 0 else None   # tests only, never as root
+ETC = TEST or "/etc/pc-bot"
+STATE_DIR = TEST or "/var/lib/pc-bot"
+KEY = os.path.join(ETC, "totp.key")
+CONF = os.path.join(ETC, "root.json")
+STATE = os.path.join(STATE_DIR, "root-state.json")
+LOCK = os.path.join(STATE_DIR, "root.lock")
+
+MAX_FAILS = 5
+MAX_OUTPUT = 200_000
+SAFE_ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/bin", "HOME": "/root",
+            "LANG": "C.UTF-8", "TERM": "dumb", "SYSTEMD_COLORS": "0", "NO_COLOR": "1"}
+
+
+def answer(obj, code=0):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+    sys.exit(code)
+
+
+def journal(msg):
+    syslog.openlog("pc-bot-root", 0, syslog.LOG_AUTHPRIV)
+    syslog.syslog(syslog.LOG_NOTICE, msg)
+
+
+def printable(text, limit=500):
+    """A command as one honest log line: newlines and control characters are
+    shown escaped, so a command can't fake extra journal lines."""
+    return "".join(c if c.isprintable() else f"\\x{ord(c):02x}" for c in text[:limit])
+
+
+def totp(secret, step):
+    mac = hmac.new(secret, struct.pack(">Q", step), hashlib.sha1).digest()
+    o = mac[-1] & 0x0F
+    return "%06d" % ((struct.unpack(">I", mac[o:o + 4])[0] & 0x7FFFFFFF) % 1_000_000)
+
+
+def load_secret():
+    with open(KEY) as f:
+        raw = f.read().strip().replace(" ", "").upper()
+    return base64.b32decode(raw + "=" * (-len(raw) % 8))
+
+
+def write_all(fd, data):
+    """os.write may write only part of the data (a file-size limit, a full
+    disk); anything short of all of it is an error, never a silent cut."""
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError("short write")
+        view = view[n:]
+
+
+def sane_limits():
+    """sudo passes the caller's resource limits through. A caller could set a
+    tiny file-size limit so this helper fails halfway through saving, or tiny
+    memory/CPU/file limits to make it crash at a moment of their choosing.
+    As root we can raise them back, so do that before anything else."""
+    for name in ("RLIMIT_FSIZE", "RLIMIT_CPU", "RLIMIT_DATA", "RLIMIT_AS", "RLIMIT_STACK", "RLIMIT_NPROC"):
+        res = getattr(resource, name, None)
+        if res is None:
+            continue
+        try:
+            resource.setrlimit(res, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+        except (ValueError, OSError):
+            if not TEST:
+                raise
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (4096, 4096))
+    except (ValueError, OSError):
+        if not TEST:
+            raise
+
+
+class State:
+    """root-state.json, read and written under an exclusive lock on root.lock.
+
+    Writes are atomic (temp file, fsync, rename), so a crash can't leave half a
+    file. A state file that exists but can't be read counts as remote root
+    being OFF, with the replay guard moved past the current codes: damage must
+    never reset the lockout or let a used code work again."""
+
+    def __init__(self):
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        self.lock = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        self.d = {"last_step": 0, "fails": 0, "disabled": False}
+        try:
+            with open(STATE) as f:
+                raw = f.read(100_000)
+        except FileNotFoundError:
+            return
+        except OSError:
+            raw = ""
+        try:
+            d = json.loads(raw)
+            if not (isinstance(d, dict) and isinstance(d.get("last_step"), int)
+                    and isinstance(d.get("fails"), int) and isinstance(d.get("disabled"), bool)):
+                raise ValueError("bad shape")
+            self.d = d
+        except ValueError:
+            self.d = {"last_step": int(time.time()) // 30 + 1, "fails": 0, "disabled": True,
+                      "disabled_why": "the state file was unreadable", "disabled_at": int(time.time())}
+            journal("state file unreadable: remote root turned OFF until pc-bot unlock")
+            self.save()
+
+    def save(self):
+        tmp = STATE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            write_all(fd, json.dumps(self.d).encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, STATE)
+        dfd = os.open(STATE_DIR, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+
+    def release(self):
+        fcntl.flock(self.lock, fcntl.LOCK_UN)
+
+
+def check_code(state, code, who):
+    """True if `code` is valid now and unused.
+
+    The attempt is written down as a wrong code BEFORE the code is compared,
+    and only cleared after a match is saved. So whatever stops the helper
+    mid-way (a crash, a full disk, a signal, a resource limit), the attempt
+    still counts, and nobody can learn whether a guess was right without it
+    costing them one of the five tries. If saving the match fails, the answer
+    is exactly what a wrong code gets."""
+    if state.d["disabled"] or state.d["fails"] >= MAX_FAILS:
+        return False, "Remote root is turned off. Turn it back on at the PC: pc-bot unlock"
+    if not (isinstance(code, str) and len(code) == 6 and code.isascii() and code.isdigit()):
+        return False, "The code must be 6 digits."
+    try:
+        secret = load_secret()
+    except (OSError, ValueError):
+        return False, "No authenticator is set up. Run the pc-bot root setup."
+
+    state.d["fails"] += 1
+    state.save()                       # raises if it can't be written: then nothing was checked
+    left = MAX_FAILS - state.d["fails"]
+    wrong = (f"Wrong code. That was {MAX_FAILS} in a row, so remote root is now off. Turn it back on at the PC: pc-bot unlock"
+             if left <= 0 else f"Wrong code. {left} more and remote root turns off.")
+
+    now = int(time.time()) // 30
+    matched = None
+    for step in (now, now - 1, now + 1):
+        if hmac.compare_digest(totp(secret, step), code):
+            matched = step
+            break
+
+    if matched is not None and matched <= state.d["last_step"]:
+        state.d["fails"] -= 1          # a repeat of a used code isn't a guess
+        try:
+            state.save()
+        except OSError:
+            pass
+        journal(f"{who}: refused a code that was already used")
+        return False, "That code was already used. Wait for the next one."
+
+    if matched is not None:
+        state.d["last_step"] = matched
+        state.d["fails"] = 0
+        try:
+            state.save()
+        except OSError:
+            journal(f"{who}: code check failed")
+            return False, wrong
+        return True, ""
+
+    if left <= 0:
+        state.d["disabled"] = True
+        state.d["disabled_why"] = f"{MAX_FAILS} wrong codes in a row"
+        state.d["disabled_at"] = int(time.time())
+        try:
+            state.save()               # even if this fails, fails >= MAX_FAILS keeps it off
+        except OSError:
+            pass
+        journal(f"{who}: {MAX_FAILS} wrong codes in a row, remote root turned OFF")
+    else:
+        journal(f"{who}: wrong code ({state.d['fails']} in a row)")
+    return False, wrong
+
+
+def kill_group(pid):
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def run_command(command, timeout):
+    """Run it, keeping only the last MAX_OUTPUT bytes of output (a command that
+    floods output can't eat memory), killing it at the deadline, and never
+    waiting on background processes that kept the output pipe open."""
+    started = time.monotonic()
+    deadline = started + timeout
+    try:
+        proc = subprocess.Popen(["/usr/bin/bash", "-c", command], cwd=TEST or "/root", env=SAFE_ENV,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    except OSError as e:
+        return {"exit": -1, "output": f"Couldn't start the command: {e.strerror}", "truncated": False,
+                "timed_out": False, "seconds": 0}
+    fd = proc.stdout.fileno()
+    buf, truncated, timed_out, eof, drain_until = bytearray(), False, False, False, None
+    while True:
+        now = time.monotonic()
+        if proc.poll() is None and now >= deadline:
+            kill_group(proc.pid)
+            timed_out = True
+        if proc.poll() is not None:
+            # Done: collect what's still buffered for a moment, then stop, even
+            # if a background child is still holding the pipe.
+            drain_until = drain_until or now + 1.0
+            if eof or now >= drain_until:
+                break
+        elif eof:
+            # Output closed but the command is still running: wait for it.
+            try:
+                proc.wait(timeout=max(0.0, deadline - now))
+            except subprocess.TimeoutExpired:
+                kill_group(proc.pid)
+                timed_out = True
+                proc.wait(5)
+            break
+        ready, _, _ = select.select([fd], [], [], 0.25)
+        if ready:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                eof = True
+                continue
+            buf += chunk
+            if len(buf) > MAX_OUTPUT:
+                del buf[:-MAX_OUTPUT]
+                truncated = True
+    proc.stdout.close()
+    if timed_out:
+        kill_group(proc.pid)
+    code = proc.returncode if proc.returncode is not None else proc.poll()
+    return {"exit": code, "output": buf.decode("utf-8", "replace"), "truncated": truncated,
+            "timed_out": timed_out, "seconds": round(time.monotonic() - started, 1)}
+
+
+def main():
+    sane_limits()
+    if len(sys.argv) > 1:
+        answer({"ok": False, "error": "pc-bot-root takes no arguments; send JSON on stdin."}, 2)
+    try:
+        conf = json.load(open(CONF))
+    except (OSError, ValueError):
+        answer({"ok": False, "error": "pc-bot-root isn't configured."}, 1)
+    caller = os.environ.get("SUDO_UID")
+    if not TEST and caller is not None and caller != str(conf.get("uid")):
+        answer({"ok": False, "error": "Not allowed for this user."}, 1)
+    who = conf.get("user", "?")
+
+    try:
+        req = json.loads(sys.stdin.read(64_000) or "{}")
+    except ValueError:
+        answer({"ok": False, "error": "Bad request."}, 2)
+    action = req.get("action")
+    state = State()
+
+    if action == "status":
+        answer({"ok": True, "disabled": state.d["disabled"], "why": state.d.get("disabled_why", ""),
+                "fails": state.d["fails"], "enrolled": os.path.exists(KEY)})
+
+    if action == "lockdown":
+        if not state.d["disabled"]:
+            state.d.update(disabled=True, disabled_why="lockdown from the bot", disabled_at=int(time.time()))
+            state.save()
+            journal(f"{who}: lockdown, remote root turned OFF")
+        answer({"ok": True, "disabled": True})
+
+    if action in ("verify", "run"):
+        ok, why = check_code(state, str(req.get("code", "")), who)
+        if not ok:
+            answer({"ok": False, "error": why, "disabled": state.d["disabled"]})
+        if action == "verify":
+            journal(f"{who}: code accepted (trusted session)")
+            answer({"ok": True})
+        command = str(req.get("command", "")).strip()
+        if not command or len(command) > 4000 or "\x00" in command:
+            answer({"ok": False, "error": "Empty or oversized command."})
+        try:
+            timeout = max(5, min(int(req.get("timeout") or 300), 1800))
+        except (TypeError, ValueError):
+            timeout = 300
+        journal(f"{who}: running as root: {printable(command)}")
+        state.release()                            # don't hold the lock while the command runs
+        result = run_command(command, timeout)
+        journal(f"{who}: finished (exit {result['exit']}, {result['seconds']}s): {printable(command, 200)}")
+        answer({"ok": True, **result})
+
+    answer({"ok": False, "error": "Unknown action."}, 2)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        # One plain answer for every failure: a traceback would tell a caller
+        # which line it died on, which is information about the code check.
+        try:
+            journal("internal error")
+        except Exception:
+            pass
+        sys.stdout.write(json.dumps({"ok": False, "error": "The root helper hit an internal error."}) + "\n")
+        sys.stdout.flush()
+        os._exit(1)
