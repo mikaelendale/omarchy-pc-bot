@@ -98,6 +98,27 @@ that chat):
 `/inbox` shows the connection, who has auto-reply, and pauses it all. Lockdown pauses
 it too. Bursts are answered together, a few seconds after the last message.
 
+### Catching up
+
+`/catchup` answers "who's waiting on me?" in one message: every chat where the other
+person wrote last, with what they want in a sentence or two, urgent ones first, and
+the ones that need no answer (a thank-you, a sticker) set apart at the bottom. Under
+it is a **Draft for <name>** button per person: tap it and you get that chat's card
+with a reply to Send, the same as above. A draft you ask for this way always waits
+for you, even for someone with auto-reply.
+
+- **`/catchup Sam`** sums up one chat instead: what has been going on in the last 60
+  messages, what was agreed, and what's still open.
+- **`/catchup daily 8:30`** sends the catch-up every day at that time (or as soon
+  after it as the PC is on), and only when someone is waiting. `/catchup daily off`
+  stops it.
+
+It works from what the bot has seen since you connected it, leaves out chats nobody
+has written in for two weeks, and never counts another bot's messages as waiting.
+The summaries come from the same locked-down Claude that writes the replies, and
+they are shown as plain text: a link or formatting in someone's message can't turn
+into a link or formatting in your catch-up.
+
 Limits from Telegram: private chats only (no groups or channels); the bot only sees
 messages from after you connected it; it can reply only within 24 hours of the
 other person's last message.
@@ -137,7 +158,7 @@ Messages sent while offline are kept and delivered later, stamped with the time.
 `/menu` gives buttons for everything. Typing `/` in the chat lists every command.
 
 `/status` `/screen` `/apps` `/lock` `/say text` `/new` `/stop` `/look` `/work` `/sudo command`
-`/logout` `/inbox` `/style name note` `/lockdown` `/away` `/all` `/quiet` `/help`
+`/logout` `/inbox` `/catchup` `/style name note` `/lockdown` `/away` `/all` `/quiet` `/help`
 
 ## Security
 
