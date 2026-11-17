@@ -102,19 +102,31 @@ it too. Bursts are answered together, a few seconds after the last message.
 
 `/catchup` answers "who's waiting on me?" in one message: every chat where the other
 person wrote last, with what they want in a sentence or two, urgent ones first, and
-the ones that need no answer (a thank-you, a sticker) set apart at the bottom. Under
-it is a **Draft for <name>** button per person: tap it and you get that chat's card
-with a reply to Send, the same as above. A draft you ask for this way always waits
-for you, even for someone with auto-reply.
+the ones that need no answer (a thank-you, a sticker) set apart at the bottom. Right
+after it come the proposed replies, one card per person who needs an answer: Send,
+Another or Skip, the same cards as above. They always wait for you, even for someone
+with auto-reply. The first six people get a reply by themselves; anyone else, and
+the ones that needed no answer, get a **Draft for <name>** button.
 
 - **`/catchup Sam`** sums up one chat instead: what has been going on in the last 60
-  messages, what was agreed, and what's still open.
+  messages, what was agreed, and what's still open, with a proposed reply if they're
+  waiting.
 - **`/catchup daily 8:30`** sends the catch-up every day at that time (or as soon
   after it as the PC is on), and only when someone is waiting. `/catchup daily off`
   stops it.
 
-It works from what the bot has seen since you connected it, leaves out chats nobody
-has written in for two weeks, and never counts another bot's messages as waiting.
+Nothing is opened: the bot gets a copy of each message as it arrives, and reading
+or summing it up never marks the chat as read. A chat is marked read only when a
+reply is sent from a card.
+
+What it can see is set by Telegram, not by the bot. It gets a chat once that person
+writes after you connected the bot, and only the private chats you picked under
+Telegram Business, Chatbots. Messages from before, groups and channels never reach
+it, and there is no way for a bot to ask Telegram for them. `/inbox` shows how many
+chats have reached the bot and how many are waiting. `/catchup` also leaves out
+chats nobody has written in for two weeks, and never counts another bot's messages
+as waiting. While the inbox is paused it still sums up, but writes no replies.
+
 The summaries come from the same locked-down Claude that writes the replies, and
 they are shown as plain text: a link or formatting in someone's message can't turn
 into a link or formatting in your catch-up.

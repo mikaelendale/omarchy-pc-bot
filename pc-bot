@@ -969,7 +969,7 @@ When someone writes to you in the chats you picked, their message shows up here 
 | Skip | leaves it for you |
 | Reply to the card | tell Claude what to say, by text or voice note |
 
-Nothing goes out until you tap Send, unless you turn on auto-reply for someone. /inbox shows who that is, and /catchup sums up who's waiting on you."""
+Nothing goes out until you tap Send, unless you turn on auto-reply for someone. /inbox shows who that is, and /catchup sums up who's waiting on you and proposes replies."""
 
 INBOX_REPLY_OFF = ("**Replying is off,** so Send won't work yet. In Telegram: Settings, Telegram Business, "
                    "Chatbots, and allow the bot to reply to messages.")
@@ -1055,6 +1055,10 @@ class Inbox:
     DIGEST = 12                 # chats in one catch-up
     SUMMARY = 60                # messages /catchup NAME sums up
     WINDOW = 24 * 3600          # Telegram lets the bot reply this long after their last message
+    PROPOSE = 6                 # replies a catch-up writes by itself; the rest get a button
+    SEES = ("The bot sees a chat once that person writes after you connected it, and only the private chats "
+            "you picked in Telegram: Settings, Telegram Business, Chatbots. Older messages, groups and channels "
+            "never reach it. Reading here never marks a chat as read.")
 
     def __init__(self, bot):
         self.bot = bot
@@ -1744,6 +1748,39 @@ class Inbox:
         chats.sort(key=lambda c: c["new"][-1].get("t", 0), reverse=True)
         return chats, quiet
 
+    def seen(self):
+        """How many chats have reached the bot, and when someone last wrote."""
+        n, last = 0, 0
+        for path in glob.glob(os.path.join(INBOX_DIR, "*.jsonl")):
+            try:
+                entries = self.history(int(os.path.basename(path)[:-6]))
+            except ValueError:
+                continue
+            if entries:
+                n += 1
+                last = max([last] + [e.get("t", 0) for e in entries if not e.get("me")])
+        return n, last
+
+    def propose(self, peer):
+        """A card with a reply for this chat, at the bottom of your chat with
+        the bot: the one already waiting further up, or a new one. It waits for
+        you even if that person has auto-reply."""
+        new = self.waiting(self.history(peer))
+        if not new:
+            return
+        with self.lock:
+            c = self.cards.get(self.open.get(peer))
+        if c and c["state"] == "writing":
+            return                               # on its way already
+        if (c and c["state"] == "ready" and c.get("mid") and c["msgs"]
+                and c["msgs"][-1].get("id") == new[-1].get("id")):
+            self.tg.delete(self.bot.chat, c["mid"])
+            c["mid"] = None
+            self.show(c)
+            return
+        self.handled.pop(peer, None)
+        self.put({"peer": peer, "manual": True})
+
     def chat_lines(self, chat, shown, width=500):
         """A chat for Claude, as JSON lines: whatever a message says, it stays
         a message."""
@@ -1765,8 +1802,6 @@ class Inbox:
         words = arg.split()
         if words and words[0].lower() == "daily":
             return self.daily_cmd(" ".join(words[1:]))
-        if self.paused():
-            return "*The inbox is paused.* /inbox turns it back on."
         peer = None
         if arg:
             peer, _, why = self.match(arg)
@@ -1821,35 +1856,47 @@ class Inbox:
             self.put({"catchup": True, "daily": True})
 
     def catchup(self, peer=None, mid=None, daily=False):
-        """Write a catch-up and put it where the "Catching up..." message is."""
-        if self.paused():
+        """Write a catch-up, put it where the "Catching up..." message is, and
+        follow it with a proposed reply for each person who needs one."""
+        if self.bot.lockdown or (daily and self.paused()):
             return
         try:
-            text, buttons = self.chat_summary(peer) if peer else self.digest(daily)
+            text, buttons, replies = self.chat_summary(peer) if peer else self.digest(daily)
         except Exception as e:
             log("inbox: catch-up failed:", repr(e))
-            text, buttons = f"*Couldn't catch up: {md(shorten(str(e), 200))}*", []
+            text, buttons, replies = f"*Couldn't catch up: {md(shorten(str(e), 200))}*", [], []
         if text is None:
             return                               # the daily one, and nobody is waiting
         try:
             if mid:
                 self.tg.edit(self.bot.chat, mid, text, buttons)
-                return
+                mid = 0
         except Exception as e:
             log("inbox: couldn't fill in the catch-up:", e)
         try:
-            self.tg.send(self.bot.chat, text, buttons=buttons, silent=not daily)
+            if mid != 0:
+                self.tg.send(self.bot.chat, text, buttons=buttons, silent=not daily)
         except Exception as e:
             log("inbox: couldn't send the catch-up:", e)
+        for p in replies:
+            try:
+                self.propose(p)
+            except Exception as e:
+                log("inbox: couldn't propose a reply:", e)
 
     def digest(self, daily=False):
-        """(text, buttons) for /catchup; (None, None) when the daily one has
-        nothing to tell you."""
+        """(text, buttons, chats to propose a reply for) for /catchup;
+        (None, None, None) when the daily one has nothing to tell you."""
         chats, quiet = self.waiting_chats()
         left_out = (f" {quiet} chat{'s' if quiet != 1 else ''} nobody has written in for two weeks "
                     f"{'is' if quiet == 1 else 'are'} left out.") if quiet else ""
         if not chats:
-            return (None, None) if daily else ("**All caught up.** Nobody is waiting on you." + left_out, [])
+            if daily:
+                return None, None, None
+            n = self.seen()[0]
+            head = (f"**All caught up.** Nobody is waiting on you in the {n} chat{'s' if n != 1 else ''} the bot "
+                    f"has seen.{left_out}" if n else "**Nothing has come in yet.**")
+            return f"{head}\n\n*{self.SEES}*", [], []
         more = max(0, len(chats) - self.DIGEST)
         chats = chats[:self.DIGEST]
         for c in chats:
@@ -1884,6 +1931,14 @@ class Inbox:
         if rest:
             out.append("\n**No answer needed**\n" + "\n".join(f"- {md(c['name'])}: {escape(c['sum'])}" for c in rest))
         tail = []
+        can = not self.paused()
+        replies = [c for c in need if not c["late"]][:self.PROPOSE] if can else []
+        if replies:
+            tail.append(("A proposed reply is below" if n == 1 else "A proposed reply for each is below"
+                         if len(replies) == n else f"Proposed replies for {len(replies)} of them are below")
+                        + ": Send, Another or Skip.")
+        elif not can:
+            tail.append("The inbox is paused, so no replies are written. /inbox turns it back on.")
         late = [md(self.first(c)) for c in need if c["late"]]
         if late:
             tail.append(f"{', '.join(late)} wrote more than a day ago. The bot can only send within 24 hours of "
@@ -1895,9 +1950,12 @@ class Inbox:
         if err:
             tail.append(f"Claude couldn't sum these up ({md(shorten(err, 120))}), so this shows each person's "
                         "last message.")
-        able = [(f"Draft for {self.first(c)}", f"ib:cu:{c['peer']}") for c in need if not c["late"]][:8]
+        # A button for whoever got no reply by itself: the ones past the first few, and "no answer needed".
+        asked = {c["peer"] for c in replies}
+        able = [(f"Draft for {self.first(c)}", f"ib:cu:{c['peer']}") for c in need + rest
+                if can and not c["late"] and c["peer"] not in asked][:8]
         return ("\n".join(out) + "".join(f"\n\n*{t}*" for t in tail),
-                [able[i:i + 2] for i in range(0, len(able), 2)])
+                [able[i:i + 2] for i in range(0, len(able), 2)], [c["peer"] for c in replies])
 
     @staticmethod
     def read_notes(out, n):
@@ -1929,11 +1987,11 @@ class Inbox:
         return notes
 
     def chat_summary(self, peer):
-        """(text, buttons) for /catchup NAME."""
+        """(text, buttons, chats to propose a reply for) for /catchup NAME."""
         entries = self.history(peer)
         them = next((e["n"] for e in reversed(entries) if e.get("n")), str(peer))
         if not entries:
-            return f"*Nothing in the chat with {md(them)} yet.*", []
+            return f"*Nothing in the chat with {md(them)} yet.*", [], []
         chat = {"peer": peer, "name": them, "entries": entries, "new": self.waiting(entries)}
         shown = entries[-self.SUMMARY:]
         name = self.conn.get("name") or "Me"
@@ -1942,7 +2000,7 @@ class Inbox:
         try:
             out = self.ask_claude(SUMMARY_PROMPT.replace("{name}", name), ask)
         except Exception as e:
-            return f"*Claude couldn't sum up the chat with {md(them)}: {md(shorten(str(e), 200))}*", []
+            return f"*Claude couldn't sum up the chat with {md(them)}: {md(shorten(str(e), 200))}*", [], []
         points = []
         for line in out.splitlines():
             line = re.sub(r"^\s*(?:[-*•–—]+|\d+[.)])\s*", "", line).replace("**", "").replace("`", "").strip()
@@ -1951,7 +2009,7 @@ class Inbox:
         k = len(shown)
         text = (f"### {md(them)}\n*The last {k} message{'s' if k != 1 else ''}, from {when(shown[0].get('t', 0))}*\n\n"
                 + ("\n".join(points[:8]) or "*Claude had nothing to say about it.*"))
-        buttons, new = [], chat["new"]
+        replies, new = [], chat["new"]
         if new:
             k = len(new)
             text += (f"\n\n**Waiting on you:** {k} message{'s' if k != 1 else ''}, "
@@ -1959,9 +2017,12 @@ class Inbox:
             if time.time() - new[-1].get("t", 0) > self.WINDOW:
                 text += (" *That's more than a day ago, and the bot can only send within 24 hours of their "
                          "last message, so answer in Telegram.*")
+            elif self.paused():
+                text += " *The inbox is paused, so no reply is written. /inbox turns it back on.*"
             else:
-                buttons = [[(f"Draft for {self.first(chat)}", f"ib:cu:{peer}")]]
-        return text, buttons
+                text += " *A proposed reply is below.*"
+                replies = [peer]
+        return text, [], replies
 
     # ---- /style
 
@@ -2014,15 +2075,17 @@ class Inbox:
                     "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1)))
         names = self.names()
         auto = [md(names.get(p, str(p))) for p in self.state.get("auto") or []]
+        seen, last = self.seen()
         rows = [("Connected", f"as {md(c.get('name'))}"),
                 ("Replying", "allowed" if c.get("reply") else "off in Telegram Business settings"),
                 ("Auto-reply", ", ".join(auto) or "nobody, every reply waits for you"),
                 ("Daily catch-up", f"at {self.state['daily']}" if self.state.get("daily") else "off"),
+                ("Chats seen", f"{seen}, the last message {when(last)}" if seen else "none yet"),
+                ("Waiting on you", str(len(self.waiting_chats()[0]))),
                 ("Inbox", "locked down" if self.bot.lockdown else "paused" if self.paused() else "on")]
         table = "\n".join(f"| {k} | {v} |" for k, v in rows)
         return ("### Your Telegram\n| | |\n|---|---|\n" + table +
-                "\n\n/catchup sums up who's waiting on you. Pick which chats come here in Telegram: "
-                "Settings, Telegram Business, Chatbots.")
+                "\n\n/catchup sums up who's waiting on you and proposes replies. " + self.SEES)
 
     def status_buttons(self):
         if not self.conn.get("enabled"):
@@ -2688,7 +2751,7 @@ Talk to Claude by typing, sending a voice note, or sending a photo. Answers stre
 | /logout | Lock the bot now |
 | /session *minutes* | How long the bot stays unlocked (default 60) |
 | /inbox | Your own chats, answered by Claude (Telegram Business) |
-| /catchup | Who's waiting on you in your own chats, summed up |
+| /catchup | Who's waiting on you in your own chats, with a reply proposed for each |
 | /catchup *name* | One chat, summed up |
 | /catchup daily *8:30* | A catch-up every day at that time |
 | /style *name note* | How you text someone, so Claude's drafts sound like you |
@@ -2696,7 +2759,7 @@ Talk to Claude by typing, sending a voice note, or sending a photo. Answers stre
 | /away /all /quiet | Which events reach you |
 
 #### Your own chats
-Connect the bot to your account (Settings, Telegram Business, Chatbots) and messages in the chats you pick show up here with a reply Claude wrote in your voice: Send, Another or Skip, or reply to the card to say what to answer. Auto-reply can be turned on per person. /catchup lists who's still waiting on you, with what each of them wants and a button to draft a reply. The Claude that writes these has no tools at all, since anyone can text you.
+Connect the bot to your account (Settings, Telegram Business, Chatbots) and messages in the chats you pick show up here with a reply Claude wrote in your voice: Send, Another or Skip, or reply to the card to say what to answer. Auto-reply can be turned on per person. /catchup lists who's still waiting on you and what each of them wants, then proposes a reply for each. The bot only sees the private chats you picked, from messages sent after you connected it, and reading them never marks them as read. The Claude that writes these has no tools at all, since anyone can text you.
 
 #### Security
 Claude, screenshots, windows and /say need the bot unlocked: send the 6-digit code from your authenticator app, and it stays unlocked for an hour after you last use it (change it with /session). Root needs a fresh code for every command, and five wrong codes lock everything down. In look mode Claude's tools can't read your SSH keys, GPG keys, browser profiles, other sessions' transcripts or this bot's token. In work mode it can run commands, so that rests on its safety check."""
@@ -2707,7 +2770,7 @@ Claude, screenshots, windows and /say need the bot unlocked: send the 6-digit co
                 ("look", "Claude can look, not change"), ("work", "Claude can run commands"),
                 ("sudo", "Run a command as root (code each time)"), ("lock", "Lock the screen"),
                 ("say", "Show a message on the PC"), ("logout", "Lock the bot now"), ("session", "How long the bot stays unlocked"),
-                ("inbox", "Claude answers your own chats"), ("catchup", "Who's waiting on you"),
+                ("inbox", "Claude answers your own chats"), ("catchup", "Who's waiting on you, with replies"),
                 ("style", "How Claude should text someone"), ("lockdown", "Turn off all remote control"), ("away", "Events only while away"),
                 ("all", "Every event"), ("quiet", "Important events only"), ("help", "What I can do")]
 
