@@ -42,6 +42,9 @@ if [[ ${1:-} == "--uninstall" ]]; then
     echo "  The root helper and security settings are still installed. Remove them with:"
     echo "    sudo $HERE/root/setup.sh --undo"
   fi
+  if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/pc-bot/account.session" ]] && ask "Sign your linked Telegram account out of pc-bot?" y; then
+    "$HERE/pc-bot" account off || true
+  fi
   if ask "Delete your settings and bot token (${XDG_CONFIG_HOME:-$HOME/.config}/pc-bot) and Inbox logs?" n; then
     rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/pc-bot" "${XDG_DATA_HOME:-$HOME/.local/share}/pc-bot" && ok "settings deleted"
   fi
