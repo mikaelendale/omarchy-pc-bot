@@ -1,15 +1,9 @@
 # pc-bot
 
-**Your PC and your chats, from your phone.** One Telegram bot that's yours alone,
-for three things:
-
-- **Your PC.** It tells you what the PC is doing while you're away (a wrong
-  password, low battery, a USB device, the camera turning on), and lets you check
-  on it, lock it, or run a root command behind an authenticator code.
-- **Claude.** Talk to Claude Code on your PC from the chat. The conversation also
-  shows live in a window on the PC, and Enter there carries it on at the desk.
-- **Your chats.** New messages in your own Telegram show up with a reply ready in
-  your voice: Send, Another or Skip. `/catchup` tells you who's waiting on you.
+Your Omarchy PC on Telegram, through a bot that's yours alone. It tells you what
+the PC is doing while you're away, lets you talk to Claude Code on it from your
+phone, runs root commands behind an authenticator code, and can answer your own
+Telegram chats in your voice.
 
 Everything runs on your PC and talks only to your bot. There's no server in the
 middle and nothing shared with anyone else.
@@ -62,26 +56,6 @@ stop button) and lands as a formatted message: headings, tables, code.
 - `/work`: Claude Code in auto mode, as in your terminal; its safety check blocks risky actions.
 - `/new` starts a fresh conversation (it also resets after 12 quiet hours); `/stop` or the
   stop button cuts an answer short.
-
-### On the PC, live
-
-While you talk to Claude from your phone, the same conversation opens in a window on
-the PC: what you said, what Claude writes as it writes it, and each thing it does
-("Reading a file: ~/notes.txt", "Running a command: ..."). Press **Enter** in that
-window to carry the conversation on at the PC, in a normal Claude Code session (a
-copy: your Telegram chat keeps its own). A look-mode conversation carries on asking
-before it acts; a work-mode one in auto mode, like your terminal. `q` closes the
-window, and it closes itself after 10 quiet minutes.
-
-`/live` opens it by hand; `/live off` stops it opening by itself. `pc-bot live` opens
-it at the PC. Nothing Claude reads (a web page, a file) can send control codes to the
-window: they're stripped first. On Omarchy, this keeps it from taking your keyboard
-when it opens:
-
-```lua
--- ~/.config/hypr/hyprland.lua
-o.window("org.omarchy.claude-live", { no_initial_focus = true })
-```
 
 Claude works in your home folder; point it at your projects folder with
 `pc-bot claude-dir ~/Work` so it picks up that folder's CLAUDE.md and memory.
@@ -158,41 +132,12 @@ they are shown as plain text: a link or formatting in someone's message can't tu
 into a link or formatting in your catch-up.
 
 Limits from Telegram: private chats only (no groups or channels); the bot only sees
-messages from after you connected it, unless you link your account (below); it can
-reply only within 24 hours of the other person's last message.
-
-### Older messages: link your account
-
-Telegram only shows a bot new messages, so at first drafts and `/catchup` know just
-what arrived after you connected it. To give them each chat's history, link your
-account at the PC:
-
-```
-pc-bot account
-```
-
-It asks for an API key of your own (from https://my.telegram.org, API development
-tools) and the login code Telegram sends you, then signs in through a small helper
-(`pc-bot-account`, using [Telethon](https://github.com/LonamiWebs/Telethon) in its own
-virtualenv). The helper:
-
-- **only reads.** It never sends, edits, deletes or marks anything as read; replies
-  still go out through the bot, with the rights you gave it.
-- **only reads the chats the bot may manage,** by your Chat Automation settings, which it
-  checks again every minute. Ask it for any other chat and it refuses.
-- **only works as you:** signed in as a different account than the bot's owner, it stops.
-
-With it, a draft sees the last 60 messages of that chat instead of what came in since
-connecting, and `/catchup` finds people who were waiting on you from before.
-
-The sign-in lives in `~/.config/pc-bot/account.session` (readable only by you, and off
-limits to the Claude you talk to). It's listed in Telegram under Settings, Devices as
-"pc-bot (read-only)". `pc-bot account off` signs it out on Telegram and deletes it.
+messages from after you connected it; it can reply only within 24 hours of the
+other person's last message.
 
 The Claude that writes these replies is separate from the one you talk to: it has
 no tools, no MCP servers, no memory and no saved transcript, and runs in an empty
-folder. It only sees that one chat (its last 30 messages, or 60 with your account
-linked). Anyone can text you, so what they
+folder. It only sees that chat's last 30 messages. Anyone can text you, so what they
 write must never reach a Claude that can read files or run commands. For the same
 reason, the chat logs (`~/.local/share/pc-bot/inbox/`, readable only by you) are off
 limits to the Claude you talk to. If anyone else connects the bot to their own
@@ -297,23 +242,16 @@ with your own keys.
 - **The bot token, once your chats are connected.** Whoever holds it can read new
   messages in the chats you picked and reply as you there (within 24 hours of their
   last message). Keep the list of chats short; disconnecting in Telegram cuts it off.
-- **The linked account's sign-in file.** If you link your account, anything that can
-  read `~/.config/pc-bot/account.session` can use your whole Telegram account, not just
-  the chats the bot manages. Only your user can read it, and the Claude you talk to is
-  denied it, but malware running as you could take it. `pc-bot account off` ends it.
 - **The phone's clock.** Codes depend on both clocks; if the PC's clock drifts more
   than 30 seconds, real codes count as wrong ones.
 
 ## Files
 
 - `pc-bot` the bot (Python, standard library only)
-- `pc-bot-account` the read-only helper for a linked account (Telethon, in
-  `~/.local/share/pc-bot/account-venv`, installed by `pc-bot account`)
 - `install.sh` install, update wiring, uninstall
 - `root/setup.sh` the security setup; `root/pc-bot-root` and `root/pc-bot-root-admin`
   are the root helpers it installs in `/usr/local/lib/pc-bot`
-- `~/.config/pc-bot/config.json` your token, chat and settings (readable only by you);
-  `account.json` and `account.session` your API key and sign-in, if you linked your account
+- `~/.config/pc-bot/config.json` your token, chat and settings (readable only by you)
 
 ## License
 

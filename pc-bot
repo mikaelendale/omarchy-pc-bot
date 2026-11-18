@@ -1,10 +1,5 @@
 #!/usr/bin/env -S python3 -I
-"""pc-bot: your PC and your chats, from your phone.
-
-Three things, in one Telegram bot that only you can use:
-  your PC      alerts while you're away, status, screenshots, lock, root with a code
-  Claude       Claude Code on your PC, from the chat; it also shows live on the PC
-  your chats   new messages in your own Telegram, with a reply ready in your voice
+"""pc-bot: your PC reports to you on Telegram.
 
   pc-bot setup                  connect a Telegram bot (asks for the token)
   pc-bot run                    the background service (systemd starts it)
@@ -17,8 +12,6 @@ Three things, in one Telegram bot that only you can use:
   pc-bot session [MINUTES]      how long one code keeps the bot unlocked (default 60)
   pc-bot claude-dir [PATH]      the folder Claude works in (default: your home)
   pc-bot update                 pull the latest version and restart
-  pc-bot account [off|status]   link your Telegram account, read-only, so drafts see older messages
-  pc-bot live                   the live window: your Telegram chat with Claude, on the PC
 
 Security (after `sudo root/setup.sh` from this folder): Claude, screenshots,
 windows and /say need the bot unlocked with a code from your authenticator app
@@ -54,17 +47,14 @@ import os
 import queue
 import random
 import re
-import select
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
-import termios
 import threading
 import time
-import tty
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -76,16 +66,8 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 SETUP_CMD = "sudo " + os.path.join(HERE, "root", "setup.sh").replace(HOME, "~", 1)
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", f"{HOME}/.config"), "pc-bot")
 CONFIG = os.path.join(CONFIG_DIR, "config.json")
-ACCOUNT_CFG = os.path.join(CONFIG_DIR, "account.json")          # your API key; the sign-in is account.session
 RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "pc-bot")
 SOCKET = os.path.join(RUNTIME, "events.sock")
-LIVE_DIR = os.path.join(RUNTIME, "live")
-LIVE_FEED = os.path.join(LIVE_DIR, "feed.log")
-LIVE_APP = "org.omarchy.claude-live"
-DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", f"{HOME}/.local/share"), "pc-bot")
-ACCOUNT_VENV = os.path.join(DATA_DIR, "account-venv")
-ACCOUNT_HELPER = os.path.join(HERE, "pc-bot-account")
-TELETHON = "telethon==1.46.0"
 DOWNLOADS = os.path.join(HOME, "Downloads")
 API = "https://api.telegram.org/bot{token}/{method}"
 MODES = ("away", "all", "quiet")
@@ -661,173 +643,6 @@ TOOL_WORDS = {"Bash": "Running a command", "Read": "Reading a file", "Edit": "Ed
               "WebSearch": "Searching the web", "WebFetch": "Reading a web page",
               "Task": "Starting a helper", "Agent": "Starting a helper", "TodoWrite": "Planning"}
 WIDGET_BLOCK = re.compile(r"```widget[^\n]*\n(.*?)(?:```|$)", re.S)
-CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")    # terminal control codes, ESC included
-SESSION_ID = re.compile(r"^[0-9a-f-]{36}$")
-
-
-def tty_safe(text):
-    """Text for a terminal with every control code taken out, so nothing Claude
-    read (a web page, a file) can drive the window."""
-    return CONTROL.sub("", str(text).replace("\r\n", "\n").replace("\t", "    "))
-
-
-def quietly(fn):
-    """The live window must never break the chat: a failure there is logged, not raised."""
-    def wrapped(*args, **kwargs):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            log(f"live: {fn.__name__}:", repr(e))
-    return wrapped
-
-
-class Live:
-    """Your Telegram conversation with Claude, on the PC as it happens. The bot
-    writes a feed (what you said, what Claude writes, each thing it does) and
-    opens a window that follows it (`pc-bot live`). Enter in that window
-    carries the conversation on at the PC, as a copy of the same session.
-    /live off stops the window opening by itself; the feed is kept either way."""
-
-    DIM, YOU, CLAUDE, OFF = "\x1b[2m", "\x1b[1;36m", "\x1b[1;35m", "\x1b[0m"
-    MARK = "```widget"
-    ARGS = ("file_path", "path", "command", "pattern", "url", "query", "description")
-    IDLE = 10 * 60              # the window closes after this long with nothing new
-
-    def __init__(self, bot):
-        self.bot = bot
-        self.at_start = True
-        self.pending, self.cut = "", False
-        self.tools = {}
-        self.opened_at = 0.0
-
-    @property
-    def on(self):
-        return (self.bot.cfg.get("claude") or {}).get("live", True) is not False
-
-    def write(self, text):
-        if not text:
-            return
-        os.makedirs(LIVE_DIR, mode=0o700, exist_ok=True)
-        with open(LIVE_FEED, "a") as f:
-            f.write(text)
-        self.at_start = text.endswith("\n")
-
-    def line(self, text):
-        self.write(("" if self.at_start else "\n") + text + "\n")
-
-    @quietly
-    def begin(self, said):
-        try:
-            if os.path.getsize(LIVE_FEED) > 1_000_000:        # keep the last part only
-                with open(LIVE_FEED, "rb") as f:
-                    f.seek(-200_000, 2)
-                    tail = f.read()
-                with open(LIVE_FEED, "wb") as f:
-                    f.write(tail[tail.find(b"\n") + 1:])
-        except OSError:
-            pass
-        self.pending, self.cut, self.tools = "", False, {}
-        self.line("")
-        self.line(f"{self.DIM}── {time.strftime('%H:%M')} {'─' * 44}{self.OFF}")
-        self.line(f"{self.YOU}You{self.OFF}  {tty_safe(said).strip()}")
-        self.write(f"{self.CLAUDE}Claude{self.OFF}  ")
-        if self.on:
-            self.open_window()
-
-    @quietly
-    def message(self):
-        """A new message from Claude (it follows its tools)."""
-        self.flush()
-        self.cut = False
-
-    @quietly
-    def text(self, t):
-        if self.cut:
-            return
-        self.pending += t
-        i = self.pending.find(self.MARK)
-        if i >= 0:                       # a visual card: Telegram shows it, the window says so
-            self.write(tty_safe(self.pending[:i]))
-            self.pending, self.cut = "", True
-            self.line(f"{self.DIM}  › Drawing a visual (it's in Telegram){self.OFF}")
-            return
-        keep = next((k for k in range(min(len(self.MARK) - 1, len(self.pending)), 0, -1)
-                     if self.MARK.startswith(self.pending[-k:])), 0)
-        self.write(tty_safe(self.pending[:len(self.pending) - keep]))
-        self.pending = self.pending[len(self.pending) - keep:]
-
-    def flush(self):
-        if self.pending and not self.cut:
-            self.write(tty_safe(self.pending))
-        self.pending = ""
-
-    @quietly
-    def tool_start(self, index, name):
-        self.tools[index] = [str(name), ""]
-
-    @quietly
-    def tool_input(self, index, part):
-        if index in self.tools:
-            self.tools[index][1] += str(part)
-
-    @quietly
-    def tool_end(self, index):
-        t = self.tools.pop(index, None)
-        if not t:
-            return
-        name, raw = t
-        try:
-            args = json.loads(raw or "{}")
-        except ValueError:
-            args = {}
-        arg = next((str(args[k]) for k in self.ARGS if isinstance(args, dict) and args.get(k)), "")
-        arg = shorten(tty_safe(arg.replace(HOME, "~")), 110)
-        self.flush()
-        self.line(f"{self.DIM}  › {TOOL_WORDS.get(name, f'Using {name}')}{': ' + arg if arg else ''}{self.OFF}")
-
-    @quietly
-    def end(self, seconds, how, session, cwd, access):
-        self.flush()
-        self.line(f"{self.DIM}── {how} · {seconds} s{self.OFF}")
-        if session and SESSION_ID.match(session):
-            with open(os.path.join(LIVE_DIR, "session.json"), "w") as f:
-                json.dump({"session": session, "cwd": cwd, "access": access}, f)
-
-    @quietly
-    def new(self):
-        self.line(f"{self.DIM}── new conversation ──{self.OFF}")
-        try:
-            os.unlink(os.path.join(LIVE_DIR, "session.json"))
-        except OSError:
-            pass
-
-    @staticmethod
-    def viewer_running():
-        try:
-            with open(os.path.join(LIVE_DIR, "viewer.pid")) as f:
-                pid = int(f.read())
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                return b"live" in f.read().split(b"\0")
-        except (OSError, ValueError):
-            return False
-
-    @quietly
-    def open_window(self, force=False):
-        if self.viewer_running() or (not force and time.time() - self.opened_at < 10):
-            return
-        me = os.path.join(HERE, "pc-bot")
-        title = "--title=Claude (Telegram)"
-        if shutil.which("xdg-terminal-exec"):
-            cmd = ["xdg-terminal-exec", f"--app-id={LIVE_APP}", title, "--", me, "live"]
-        elif shutil.which("foot"):
-            cmd = ["foot", f"--app-id={LIVE_APP}", title, "-e", me, "live"]
-        else:
-            return
-        if shutil.which("systemd-run"):      # outside the bot's service, so a restart doesn't close it
-            cmd = ["systemd-run", "--user", "--collect", "--quiet", "--"] + cmd
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
-        self.opened_at = time.time()
 
 
 class ClaudeChat:
@@ -851,7 +666,6 @@ class ClaudeChat:
         self.thread = None
         self.stopped = False
         self.draft_id = 0
-        self.live = Live(bot)
 
     @property
     def state(self):
@@ -887,7 +701,6 @@ class ClaudeChat:
         self.stop()
         self.state.pop("session", None)
         save_config(self.bot.cfg)
-        self.live.new()
 
     @staticmethod
     def view(header, text, doing):
@@ -965,9 +778,6 @@ class ClaudeChat:
         self.proc.stdin.close()
         killer = threading.Timer(self.TIMEOUT, self.proc.kill)
         killer.start()
-        started = time.time()
-        said = " ".join(b.get("text", "") for b in content if b.get("type") == "text")
-        self.live.begin(("[photo] " if any(b.get("type") == "image" for b in content) else "") + said)
 
         text, everything, doing, final, failed, session = "", "", "", None, None, None
         shown, last_draft = "", 0.0
@@ -985,22 +795,15 @@ class ClaudeChat:
                     if text.strip():
                         everything += text.strip() + "\n\n"
                     text = ""
-                    self.live.message()
                 elif ev.get("type") == "content_block_start":
                     block = ev.get("content_block") or {}
                     if block.get("type") == "tool_use":
                         doing = TOOL_WORDS.get(block.get("name"), f"Using {block.get('name')}")
-                        self.live.tool_start(ev.get("index"), block.get("name"))
                 elif ev.get("type") == "content_block_delta":
                     delta = ev.get("delta") or {}
                     if delta.get("type") == "text_delta":
                         text += delta.get("text", "")
                         doing = ""
-                        self.live.text(delta.get("text", ""))
-                    elif delta.get("type") == "input_json_delta":
-                        self.live.tool_input(ev.get("index"), delta.get("partial_json", ""))
-                elif ev.get("type") == "content_block_stop":
-                    self.live.tool_end(ev.get("index"))
             elif kind == "result":
                 session = d.get("session_id") or session
                 if d.get("is_error"):
@@ -1017,8 +820,6 @@ class ClaudeChat:
                 shown, last_draft = view, now
         killer.cancel()
         self.proc.wait()
-        self.live.end(int(time.time() - started), "stopped" if self.stopped else "done" if final is not None
-                      else "didn't finish", session, cwd, st.get("access", "look"))
 
         if session:
             st["session"], st["at"] = session, time.time()
@@ -1230,88 +1031,6 @@ def clean_reply(text):
     return t
 
 
-class Account:
-    """pc-bot-account (see that file): the read-only helper signed in as you,
-    so drafts and /catchup can read older messages in the chats the bot may
-    manage. It runs in its own virtualenv with Telethon and answers one JSON
-    request per line. Linked with `pc-bot account` at the PC, never from the chat."""
-
-    TIMEOUT = 40
-
-    def __init__(self, bot):
-        self.bot = bot
-        self.proc = None
-        self.lock = threading.Lock()
-        self.failed_at = 0.0
-        self.error = ""
-
-    @staticmethod
-    def linked():
-        return os.path.exists(ACCOUNT_CFG) and os.path.exists(os.path.join(CONFIG_DIR, "account.session"))
-
-    def reset(self):
-        with self.lock:
-            self.kill()
-            self.failed_at, self.error = 0.0, ""
-
-    def kill(self):
-        if self.proc and self.proc.poll() is None:
-            self.proc.kill()
-        self.proc = None
-
-    def read_line(self, timeout):
-        if not select.select([self.proc.stdout], [], [], timeout)[0]:
-            return None
-        return self.proc.stdout.readline() or None
-
-    def start(self):
-        python = os.path.join(ACCOUNT_VENV, "bin", "python")
-        try:
-            bot_id = int(str(self.bot.cfg["token"]).split(":")[0])
-            self.proc = subprocess.Popen([python, "-I", ACCOUNT_HELPER, "serve", "--config", ACCOUNT_CFG,
-                                          "--owner", str(self.bot.chat), "--bot", str(bot_id)],
-                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
-            first = json.loads(self.read_line(120) or "{}")
-        except (OSError, ValueError) as e:
-            first = {"error": str(e)}
-        if first.get("ready"):
-            if self.error:
-                log("account: working again")
-            self.error = ""
-            return True
-        error = str(first.get("error") or "the helper didn't start")
-        if error != self.error:
-            log("account:", error)
-            self.bot.event(f"**Your linked account stopped working:** {md(error)}. Drafts only see new messages "
-                           "until it's fixed; at the PC: `pc-bot account`.", important=True, kind="account", every=86400)
-        self.error = error
-        self.kill()
-        self.failed_at = time.time()
-        return False
-
-    def call(self, op, **kwargs):
-        """The helper's answer, or None when the account isn't linked or isn't answering."""
-        if not self.linked():
-            return None
-        with self.lock:
-            if self.proc is None or self.proc.poll() is not None:
-                if time.time() - self.failed_at < 600 or not self.start():
-                    return None
-            try:
-                self.proc.stdin.write(json.dumps(dict(op=op, **kwargs)) + "\n")
-                self.proc.stdin.flush()
-                line = self.read_line(self.TIMEOUT)
-                return json.loads(line) if line else self.give_up("no answer")
-            except (OSError, ValueError) as e:
-                return self.give_up(str(e))
-
-    def give_up(self, why):
-        log("account: helper failed:", why)
-        self.kill()
-        self.failed_at = time.time()
-        return None
-
-
 class Inbox:
     """Your own Telegram account, through Telegram Business (Settings,
     Telegram Business, Chatbots). New messages in the chats you picked come to
@@ -1340,77 +1059,6 @@ class Inbox:
     SEES = ("The bot sees a chat once that person writes after you connected it, and only the private chats "
             "you picked in Telegram: Settings, Telegram Business, Chatbots. Older messages, groups and channels "
             "never reach it. Reading here never marks a chat as read.")
-    SEES_LINKED = ("Your account is linked (read-only), so the bot also reads the history of the private chats you "
-                   "picked in Telegram: Settings, Telegram Business, Chatbots, including messages from before you "
-                   "connected it. Groups, channels and other chats never reach it. Reading never marks a chat as read.")
-
-    def sees(self):
-        return self.SEES_LINKED if self.bot.account.linked() else self.SEES
-
-    def context(self):
-        """Messages of a chat Claude sees: more once your account is linked."""
-        return 60 if self.bot.account.linked() else self.CONTEXT
-
-    def sync(self, peer, limit=60):
-        """Pull this chat's recent history from your account (when linked) into
-        its log. Only chats the bot may manage come back; anything else is refused
-        by the helper itself."""
-        r = self.bot.account.call("history", peer=int(peer), limit=limit)
-        msgs = r.get("messages") if r and r.get("ok") else None
-        if not msgs:
-            return False
-
-        def merge(entries):
-            have = {e.get("id") for e in entries}
-            near = [(bool(e.get("me")), str(e.get("text", ""))[:80], e.get("t", 0)) for e in entries[-100:]]
-            for m in msgs:
-                if not isinstance(m, dict) or not isinstance(m.get("id"), int) or m["id"] in have:
-                    continue
-                me, text, t = bool(m.get("me")), str(m.get("text", ""))[:4000], int(m.get("t") or 0)
-                if any(a == me and b == text[:80] and abs(c - t) <= 3 for a, b, c in near):
-                    continue                     # the same message, already here from the bot
-                e = {"id": m["id"], "t": t, "me": me, "text": text, "src": "account"}
-                if not me:
-                    e["n"] = shorten(str(m.get("n") or ""), 40) or "Someone"
-                entries.append(e)
-            entries.sort(key=lambda e: e.get("id", 0))
-            return entries
-        self.change(peer, merge)
-        return True
-
-    def sync_all(self, force=False, everything=False):
-        """Before a catch-up: every allowed chat where they wrote last (or, when
-        just linked, every allowed chat), from your account. At most every two minutes."""
-        if not self.bot.account.linked() or (not force and time.time() - self.synced_at < 120):
-            return None
-        r = self.bot.account.call("dialogs", limit=200)
-        if not r or not r.get("ok"):
-            return None
-        self.synced_at = time.time()
-        dialogs = r.get("dialogs") or []
-        for d in dialogs[:40]:
-            last = d.get("last") or {}
-            if everything or (last and not last.get("me") and time.time() - last.get("t", 0) < self.QUIET):
-                self.sync(d["peer"], 60 if everything else 40)
-        return dialogs
-
-    def account_linked(self):
-        """Just linked at the PC (`pc-bot account`): pull history in and say so."""
-        self.bot.account.reset()
-        if not self.bot.account.linked():
-            self.say("**Your account is unlinked.** Drafts only see messages from after you connected the bot.")
-            return
-        dialogs = self.sync_all(force=True, everything=True)
-        if dialogs is None:
-            self.say(f"**Your account didn't link:** {md(self.bot.account.error or 'the helper did not answer')}. "
-                     "At the PC: `pc-bot account`.")
-            return
-        n = len(dialogs)
-        self.say(f"**Your account is linked,** read-only. The bot read the history of the {n} chat"
-                 f"{'s' if n != 1 else ''} Chat Automation gives it, so drafts and /catchup see older messages "
-                 "too. It never sends, marks anything as read, or reads other chats. Undo at the PC: "
-                 "`pc-bot account off`.")
-
 
     def __init__(self, bot):
         self.bot = bot
@@ -1423,7 +1071,6 @@ class Inbox:
         self.auto_sent = {}         # their chat id -> times of automatic replies
         self.handled = {}           # their chat id -> last message you skipped (not shown again)
         self.bad_conns = set()
-        self.synced_at = 0.0
 
     @property
     def tg(self):
@@ -1693,8 +1340,6 @@ class Inbox:
                 c["state"], c["error"] = "error", f"Couldn't hear your voice note: {e}"
                 self.show(c)
                 return
-        if self.bot.account.linked():
-            self.sync(peer)                  # the chat's older messages, for context
         entries = self.history(peer)
         mine = sum(1 for e in entries if e.get("me"))
         last = max((i for i, e in enumerate(entries) if e.get("me")), default=-1)
@@ -1764,7 +1409,7 @@ class Inbox:
             them += " (the other person)"
         lines = [json.dumps({"time": stamp(e.get("t", 0)), "from": name if e.get("me") else them,
                              "text": str(e.get("text", ""))[:2000]}, ensure_ascii=False)
-                 for e in entries[-self.context():]]
+                 for e in entries[-self.CONTEXT:]]
         notes = self.state.get("style") or {}
         style = [n for n in (notes.get("all"), notes.get(str(peer))) if n]
         ask = f"Write {name}'s next message."
@@ -1818,7 +1463,7 @@ class Inbox:
     def listen(self, peer, entries):
         """Their voice notes to text (once each), for Claude and the card."""
         done = {}
-        for e in [e for e in entries[-self.context():] if e.get("voice") and not e.get("heard")][-5:]:
+        for e in [e for e in entries[-self.CONTEXT:] if e.get("voice") and not e.get("heard")][-5:]:
             e["heard"] = True
             if e.get("dur", 0) <= 300:
                 try:
@@ -2082,12 +1727,9 @@ class Inbox:
         last = max((i for i, e in enumerate(entries) if e.get("me")), default=-1)
         return [e for e in entries[last + 1:] if not e.get("me") and not e.get("robot")]
 
-    def waiting_chats(self, sync=False):
+    def waiting_chats(self):
         """Chats where they wrote last, newest first, and how many more have
-        been quiet too long to list. sync: first pull the waiting ones in from
-        your account, if linked (slow; the worker only)."""
-        if sync:
-            self.sync_all()
+        been quiet too long to list."""
         now, chats, quiet = time.time(), [], 0
         for path in glob.glob(os.path.join(INBOX_DIR, "*.jsonl")):
             try:
@@ -2165,7 +1807,7 @@ class Inbox:
             peer, _, why = self.match(arg)
             if why:
                 return why
-        elif not self.bot.account.linked() and not self.waiting_chats()[0]:
+        elif not self.waiting_chats()[0]:
             return self.digest()[0]              # all caught up: nothing for Claude to read
         try:
             mid = self.tg.send(self.bot.chat, "*Catching up...*", silent=True).get("message_id")
@@ -2245,7 +1887,7 @@ class Inbox:
     def digest(self, daily=False):
         """(text, buttons, chats to propose a reply for) for /catchup;
         (None, None, None) when the daily one has nothing to tell you."""
-        chats, quiet = self.waiting_chats(sync=True)
+        chats, quiet = self.waiting_chats()
         left_out = (f" {quiet} chat{'s' if quiet != 1 else ''} nobody has written in for two weeks "
                     f"{'is' if quiet == 1 else 'are'} left out.") if quiet else ""
         if not chats:
@@ -2254,7 +1896,7 @@ class Inbox:
             n = self.seen()[0]
             head = (f"**All caught up.** Nobody is waiting on you in the {n} chat{'s' if n != 1 else ''} the bot "
                     f"has seen.{left_out}" if n else "**Nothing has come in yet.**")
-            return f"{head}\n\n*{self.sees()}*", [], []
+            return f"{head}\n\n*{self.SEES}*", [], []
         more = max(0, len(chats) - self.DIGEST)
         chats = chats[:self.DIGEST]
         for c in chats:
@@ -2346,8 +1988,6 @@ class Inbox:
 
     def chat_summary(self, peer):
         """(text, buttons, chats to propose a reply for) for /catchup NAME."""
-        if self.bot.account.linked():
-            self.sync(peer, self.SUMMARY)
         entries = self.history(peer)
         them = next((e["n"] for e in reversed(entries) if e.get("n")), str(peer))
         if not entries:
@@ -2442,14 +2082,10 @@ class Inbox:
                 ("Daily catch-up", f"at {self.state['daily']}" if self.state.get("daily") else "off"),
                 ("Chats seen", f"{seen}, the last message {when(last)}" if seen else "none yet"),
                 ("Waiting on you", str(len(self.waiting_chats()[0]))),
-                ("Your account", ("linked, read-only" + (f", but: {md(self.bot.account.error)}"
-                                                          if self.bot.account.error else ""))
-                 if self.bot.account.linked() else "not linked: at the PC, `pc-bot account` lets drafts see "
-                                                   "older messages"),
                 ("Inbox", "locked down" if self.bot.lockdown else "paused" if self.paused() else "on")]
         table = "\n".join(f"| {k} | {v} |" for k, v in rows)
         return ("### Your Telegram\n| | |\n|---|---|\n" + table +
-                "\n\n/catchup sums up who's waiting on you and proposes replies. " + self.sees())
+                "\n\n/catchup sums up who's waiting on you and proposes replies. " + self.SEES)
 
     def status_buttons(self):
         if not self.conn.get("enabled"):
@@ -2478,7 +2114,6 @@ class Bot:
         self.last_root = ""
         self.fails = []               # wrong-password times, for counting
         self.claude = ClaudeChat(self)
-        self.account = Account(self)
         self.inbox = Inbox(self)
         self.widgets_retry_at = 0.0     # Telegram widgets roll out per bot; retry later if refused
         self.root = RootHelper()
@@ -2738,9 +2373,6 @@ class Bot:
                 if d.get("action") == "lockdown":
                     self.do_lockdown("from the PC")
                     self.tg.send(self.chat, self.LOCKED_DOWN)
-                    continue
-                if d.get("action") == "account":          # `pc-bot account` linked or unlinked it
-                    threading.Thread(target=self.inbox.account_linked, daemon=True, name="account").start()
                     continue
                 if d.get("action") == "claude_dir":
                     self.claude.state["dir"] = str(d.get("dir") or "")
@@ -3025,26 +2657,17 @@ class Bot:
         d = self.status_data()
         here = "Locked screen" if d["l"] else "Away" if d["a"] else "At the PC"
         bat = f"{d['b']}% {d['bs']}" if d["b"] is not None else "no battery"
-        claude = ("can run commands" if d["c"] == "work" else "can look, not change") + \
-            (" · live window on the PC" if self.claude.live.on else "")
-        if self.inbox.conn.get("enabled"):
-            n = len(self.inbox.waiting_chats()[0])
-            chats = (f"{n} waiting on you" if n else "nobody waiting") + \
-                (" · account linked" if self.account.linked() else "")
-        else:
-            chats = "not connected (/inbox)"
-        return (f"### {md(d['h'])}\n*Your PC and your chats, from your phone.*\n\n"
-                f"{here} · {bat} · on for {human_duration(d['u'])}\n\n"
-                f"| | |\n|---|---|\n| Alerts | {self.mode} |\n| Claude | {claude} |\n| Your chats | {chats} |\n"
-                f"| Security | {self.security_line()} |")
+        claude = "can run commands" if d["c"] == "work" else "can look, not change"
+        return (f"### {md(d['h'])}\n{here} · {bat} · on for {human_duration(d['u'])}\n\n"
+                f"| | |\n|---|---|\n| Security | {self.security_line()} |\n| Claude | {claude} |\n"
+                f"| Events | {self.mode} |")
 
     def menu_buttons(self):
         access = self.claude.state.get("access", "look")
         events = {"away": "Events: away", "all": "Events: all", "quiet": "Events: quiet"}[self.mode]
-        rows = [[("Status", "m:status"), ("Screen", "m:screen"), ("Windows", "m:apps"), (events, "m:events")],
+        rows = [[("Status", "m:status"), ("Screen", "m:screen"), ("Windows", "m:apps")],
                 [("Claude: " + ("Work" if access == "work" else "Look"), "m:claude"), ("New chat", "m:new"),
-                 ("Live window", "m:live")],
-                [("Inbox", "m:inbox"), ("Catch up", "m:catchup")],
+                 (events, "m:events")],
                 [("Lock screen", "m:lock"), ("Lockdown", "m:lockdown")]]
         if self.trusted():
             rows[-1].append(("Lock bot", "m:logout"))
@@ -3096,7 +2719,7 @@ class Bot:
             elif what == "status" and (q.get("message") or {}).get("photo"):
                 self.tg.delete(self.chat, mid)        # refresh: replace the old card
                 self.send_status()
-            elif what in ("status", "screen", "apps", "lock", "lockdown", "new", "logout", "inbox", "catchup", "live"):
+            elif what in ("status", "screen", "apps", "lock", "lockdown", "new", "logout"):
                 # Buttons map to a fixed set of commands. Button data is never
                 # run as typed text: anyone holding the bot token can send
                 # messages with buttons of their own making.
@@ -3110,68 +2733,46 @@ class Bot:
         self.tg.answer_callback(q.get("id"), toast)
 
     HELP = """### pc-bot
-Your PC and your chats, from your phone. /menu has buttons for everything.
-
-#### Your PC
-It tells you what the PC is doing while you're away (wrong passwords, low battery, USB, the camera, downloads...), and lets you check on it and control it from here.
+Talk to Claude by typing, sending a voice note, or sending a photo. Answers stream in live; tap stop to cut one short. /menu has buttons for everything.
 
 | | |
 |---|---|
+| /menu | Buttons for everything below |
 | /status | Battery, heat, memory, disk, what's open |
 | /screen | A screenshot of every screen |
 | /apps | The open windows |
 | /lock | Lock the screen |
 | /say *text* | Show a message on the PC |
-| /sudo *command* | Run a command as root; needs a fresh code every time |
-| /away /all /quiet | Which alerts reach you |
-
-#### Claude
-Type, send a voice note or a photo, and Claude Code answers from your PC. Its answer streams in here, and the same conversation shows live in a window on the PC; press Enter there to carry it on at the desk.
-
-| | |
-|---|---|
-| /new | Start a fresh conversation |
+| /new | Start a fresh conversation with Claude |
 | /stop | Stop Claude mid-answer |
 | /look | Claude can read files and search the web, but can't change anything |
 | /work | Claude can also run commands and edit files (with the same safety check as your terminal) |
-| /live | Open the live window on the PC now; `/live off` stops it opening by itself |
-
-#### Your chats
-Connect the bot to your own Telegram (Settings, Telegram Business, Chatbots) and new messages in the chats you pick show up here with a reply in your voice: Send, Another or Skip, or reply to the card to say what to answer.
-
-| | |
-|---|---|
-| /inbox | The connection, auto-reply, pause |
-| /catchup | Who's waiting on you, with a reply proposed for each |
-| /catchup *name* | One chat, summed up |
-| /catchup daily *8:30* | A catch-up every day at that time |
-| /style *name note* | How you text someone, so drafts sound like you |
-
-Link your account at the PC with `pc-bot account` (read-only) and drafts also see each chat's older messages. The Claude that writes replies has no tools at all, since anyone can text you.
-
-#### Security
-Claude, screenshots, windows and /say need the bot unlocked: send the 6-digit code from your authenticator app, and it stays unlocked for an hour after you last use it. Root needs a fresh code for every command, and five wrong codes lock everything down.
-
-| | |
-|---|---|
+| /sudo *command* | Run a command as root; needs a fresh code every time |
 | /logout | Lock the bot now |
 | /session *minutes* | How long the bot stays unlocked (default 60) |
+| /inbox | Your own chats, answered by Claude (Telegram Business) |
+| /catchup | Who's waiting on you in your own chats, with a reply proposed for each |
+| /catchup *name* | One chat, summed up |
+| /catchup daily *8:30* | A catch-up every day at that time |
+| /style *name note* | How you text someone, so Claude's drafts sound like you |
 | /lockdown | Turn off all remote control until you unlock it at the PC |
+| /away /all /quiet | Which events reach you |
 
-In look mode Claude's tools can't read your SSH keys, GPG keys, browser profiles, other sessions' transcripts, your chats or this bot's token. In work mode it can run commands, so that rests on its safety check."""
+#### Your own chats
+Connect the bot to your account (Settings, Telegram Business, Chatbots) and messages in the chats you pick show up here with a reply Claude wrote in your voice: Send, Another or Skip, or reply to the card to say what to answer. Auto-reply can be turned on per person. /catchup lists who's still waiting on you and what each of them wants, then proposes a reply for each. The bot only sees the private chats you picked, from messages sent after you connected it, and reading them never marks them as read. The Claude that writes these has no tools at all, since anyone can text you.
 
-    COMMANDS = [("menu", "Buttons for everything"),
-                ("status", "Your PC: battery, heat, memory, disk"), ("screen", "Your PC: a screenshot"),
-                ("apps", "Your PC: open windows"), ("lock", "Your PC: lock the screen"),
-                ("say", "Your PC: show a message on it"), ("sudo", "Your PC: run as root (code each time)"),
-                ("new", "Claude: fresh conversation"), ("stop", "Claude: stop"),
-                ("look", "Claude: can look, not change"), ("work", "Claude: can run commands"),
-                ("live", "Claude: show this chat on the PC"),
-                ("inbox", "Your chats: connection, auto-reply"), ("catchup", "Your chats: who's waiting on you"),
-                ("style", "Your chats: how you text someone"),
-                ("logout", "Lock the bot now"), ("session", "How long the bot stays unlocked"),
-                ("lockdown", "Turn off all remote control"), ("away", "Alerts only while away"),
-                ("all", "Every alert"), ("quiet", "Important alerts only"), ("help", "What I can do")]
+#### Security
+Claude, screenshots, windows and /say need the bot unlocked: send the 6-digit code from your authenticator app, and it stays unlocked for an hour after you last use it (change it with /session). Root needs a fresh code for every command, and five wrong codes lock everything down. In look mode Claude's tools can't read your SSH keys, GPG keys, browser profiles, other sessions' transcripts or this bot's token. In work mode it can run commands, so that rests on its safety check."""
+
+    COMMANDS = [("menu", "Buttons for everything"), ("status", "Battery, heat, memory, disk"),
+                ("screen", "Screenshot of every screen"), ("apps", "Open windows"),
+                ("new", "Fresh conversation with Claude"), ("stop", "Stop Claude"),
+                ("look", "Claude can look, not change"), ("work", "Claude can run commands"),
+                ("sudo", "Run a command as root (code each time)"), ("lock", "Lock the screen"),
+                ("say", "Show a message on the PC"), ("logout", "Lock the bot now"), ("session", "How long the bot stays unlocked"),
+                ("inbox", "Claude answers your own chats"), ("catchup", "Who's waiting on you, with replies"),
+                ("style", "How Claude should text someone"), ("lockdown", "Turn off all remote control"), ("away", "Events only while away"),
+                ("all", "Every event"), ("quiet", "Important events only"), ("help", "What I can do")]
 
     # ---- commands
 
@@ -3184,14 +2785,6 @@ In look mode Claude's tools can't read your SSH keys, GPG keys, browser profiles
             return None
         if cmd == "/help":
             return self.HELP
-        if cmd == "/live":
-            word = arg.lower()
-            if word in ("on", "off"):
-                self.claude.state["live"] = word == "on"
-                save_config(self.cfg)
-                return ("**Live window on.** When you message Claude, the conversation opens in a window on the PC."
-                        if word == "on" else "**Live window off.** It won't open by itself; /live opens it once.")
-            return self.gated(self.open_live, "show this chat on the PC")
         if cmd == "/style":
             return self.inbox.style_cmd(arg)
         if cmd == "/inbox":
@@ -3305,10 +2898,6 @@ In look mode Claude's tools can't read your SSH keys, GPG keys, browser profiles
         finally:
             os.unlink(path)
         return None
-
-    def open_live(self):
-        self.claude.live.open_window(force=True)
-        return "*The live window is open on the PC.* `/live off` stops it opening by itself."
 
     def say(self, text):
         run(["notify-send", "-a", "pc-bot", "--", "From your phone", text[:500]])
@@ -3504,7 +3093,7 @@ In look mode Claude's tools can't read your SSH keys, GPG keys, browser profiles
         signal.signal(signal.SIGTERM, on_term)
         try:
             self.tg.set_commands(self.COMMANDS)
-            self.tg.call("setMyShortDescription", {"short_description": "Your PC and your chats, from your phone: alerts, Claude Code, and replies in your voice."})
+            self.tg.call("setMyShortDescription", {"short_description": "Your PC, on Telegram: events, Claude, and root with a code."})
         except Exception as e:
             log("couldn't set the command list:", e)
         workers = [self.sender, self.poll, self.watch_presence, self.watch_power, self.watch_journal,
@@ -3767,202 +3356,11 @@ def cmd_run(_args):
     return 0
 
 
-ACCOUNT_INTRO = """Link your Telegram account to pc-bot (read-only)
-
-Drafts and /catchup only see messages that reached the bot after you connected
-it through Telegram Business. Linking your account lets them read each allowed
-chat's older messages too.
-
-  - It only reads. It never sends, edits, deletes or marks anything as read.
-  - It only reads the private chats your Chat Automation settings give the bot
-    (Settings, Telegram Business, Chatbots), checked again every minute.
-  - The sign-in is saved in ~/.config/pc-bot/account.session, readable only by
-    you, and the bot's Claude can't open it. Anyone who gets that file can use
-    your Telegram account, like a logged-in device. It's listed in Telegram
-    under Settings, Devices as "pc-bot (read-only)".
-  - Undo any time: pc-bot account off (signs it out on Telegram and deletes it).
-
-You need an API key of your own, from Telegram:
-  1. Open https://my.telegram.org and log in with your phone number.
-  2. API development tools: create an app (any name, like "pc-bot"; platform: Desktop).
-  3. Keep that page open: you need the api_id (a number) and the api_hash.
-"""
-
-
-def account_python():
-    """The helper's own virtualenv with Telethon, made on first use."""
-    python = os.path.join(ACCOUNT_VENV, "bin", "python")
-    ok = lambda: os.path.exists(python) and subprocess.run(  # noqa: E731
-        [python, "-I", "-c", "import telethon"], capture_output=True).returncode == 0
-    if ok():
-        return python
-    print(f"Installing Telethon (the Telegram client library) into {ACCOUNT_VENV.replace(HOME, '~')}...")
-    if os.path.isdir(ACCOUNT_VENV):
-        shutil.rmtree(ACCOUNT_VENV)
-    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
-    uv = shutil.which("uv")
-    steps = ([[uv, "venv", "-q", ACCOUNT_VENV], [uv, "pip", "install", "-q", "--python", python, TELETHON]] if uv else
-             [[sys.executable, "-m", "venv", ACCOUNT_VENV], [python, "-m", "pip", "install", "-q", TELETHON]])
-    for step in steps:
-        if subprocess.run(step).returncode != 0:
-            return None
-    return python if ok() else None
-
-
-def cmd_account(args):
-    """Link (or unlink) your own Telegram account, read-only. At the PC only:
-    it asks for your API key and the login code Telegram sends you."""
-    cfg = load_config()
-    if not (cfg.get("token") and cfg.get("chat_id")):
-        print("Set the bot up first: pc-bot setup")
-        return 1
-    sub = (args[0] if args else "").lower()
-    if sub in ("off", "unlink", "logout"):
-        python = os.path.join(ACCOUNT_VENV, "bin", "python")
-        if os.path.exists(ACCOUNT_CFG) and os.path.exists(python):
-            subprocess.run([python, "-I", ACCOUNT_HELPER, "logout", "--config", ACCOUNT_CFG])
-        for path in (ACCOUNT_CFG, os.path.join(CONFIG_DIR, "account.session"),
-                     os.path.join(CONFIG_DIR, "account.session-journal")):
-            if os.path.exists(path):
-                os.unlink(path)
-        to_daemon({"action": "account"})
-        print("Unlinked. Drafts only see messages from after you connected the bot.")
-        return 0
-    if sub == "status":
-        print("Linked, read-only." if Account.linked() else "Not linked. Link it with: pc-bot account")
-        return 0
-    if sub:
-        print("Usage: pc-bot account [off|status]")
-        return 2
-    print(ACCOUNT_INTRO)
-    if input("Link it now? [y/N] ").strip().lower() not in ("y", "yes"):
-        return 0
-    python = account_python()
-    if not python:
-        print("Couldn't install Telethon. Check your internet connection and try again.")
-        return 1
-    if not os.path.exists(ACCOUNT_CFG):
-        api_id = input("\napi_id: ").strip()
-        api_hash = getpass.getpass("api_hash (hidden): ").strip()
-        if not api_id.isdigit() or not re.fullmatch(r"[0-9a-f]{32}", api_hash):
-            print("Those don't look right: api_id is a number and api_hash is 32 letters and digits.")
-            return 1
-        os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, prefix=".account-", suffix=".tmp")
-        with os.fdopen(fd, "w") as f:
-            json.dump({"api_id": int(api_id), "api_hash": api_hash}, f)
-        os.replace(tmp, ACCOUNT_CFG)
-    print()
-    if subprocess.run([python, "-I", ACCOUNT_HELPER, "login", "--config", ACCOUNT_CFG,
-                       "--owner", str(cfg["chat_id"])]).returncode != 0:
-        print("Not linked.")
-        return 1
-    if not to_daemon({"action": "account"}):
-        print("The bot isn't running; it uses the account once it starts.")
-    else:
-        print("The bot is reading the allowed chats now and will confirm in Telegram.")
-    return 0
-
-
-def carry_on():
-    """Enter in the live window: open the Telegram conversation at the PC, as a
-    copy, so the bot's own session keeps going untouched."""
-    try:
-        with open(os.path.join(LIVE_DIR, "session.json")) as f:
-            s = json.load(f)
-    except (OSError, ValueError):
-        s = {}
-    sid = str(s.get("session") or "")
-    claude = find_claude()
-    if not SESSION_ID.match(sid) or not claude:
-        print("\nNothing to carry on yet: message Claude from Telegram first." if claude
-              else "\nClaude Code isn't installed.")
-        return
-    # Work mode carries on in auto mode, as in your terminal. A look-mode chat
-    # (it may have read web pages) carries on asking before it acts.
-    mode = ["--permission-mode", "auto"] if s.get("access") == "work" else []
-    print("\n\nCarrying it on here. This is a copy: your Telegram chat keeps its own.\n", flush=True)
-    try:
-        os.unlink(os.path.join(LIVE_DIR, "viewer.pid"))
-    except OSError:
-        pass
-    cwd = s.get("cwd") if os.path.isdir(str(s.get("cwd") or "")) else HOME
-    os.chdir(cwd)
-    os.execvp(claude, [claude, *mode, "--resume", sid, "--fork-session"])
-
-
-def cmd_live(_args):
-    """The live window: follows the feed of your Telegram chat with Claude.
-    Enter carries it on at the PC; q closes; it closes itself after 10 quiet minutes."""
-    os.makedirs(LIVE_DIR, mode=0o700, exist_ok=True)
-    pidfile = os.path.join(LIVE_DIR, "viewer.pid")
-    with open(pidfile, "w") as f:
-        f.write(str(os.getpid()))
-    out = sys.stdout.buffer
-    interactive = sys.stdin.isatty()
-    saved = termios.tcgetattr(0) if interactive else None
-    feed, last = None, time.time()
-    try:
-        if interactive:
-            tty.setcbreak(0)
-        out.write((Live.DIM + "Your Telegram chat with Claude, live.   Enter: carry it on here   q: close"
-                   + Live.OFF + "\n").encode())
-        out.flush()
-        while True:
-            if feed is None and os.path.exists(LIVE_FEED):
-                feed = open(LIVE_FEED, "rb")
-                size = os.path.getsize(LIVE_FEED)
-                if size > 20_000:
-                    feed.seek(size - 20_000)
-                    feed.readline()              # start at a whole line
-            if feed is not None:
-                try:
-                    if os.path.getsize(LIVE_FEED) < feed.tell():
-                        feed.close()             # the bot trimmed it: start again
-                        feed = None
-                        continue
-                except OSError:
-                    feed.close()
-                    feed = None
-                    continue
-                chunk = feed.read()
-                if chunk:
-                    out.write(chunk)
-                    out.flush()
-                    last = time.time()
-            if interactive and select.select([0], [], [], 0.25)[0]:
-                key = os.read(0, 1)
-                if key in (b"q", b"Q"):
-                    break
-                if key in (b"\r", b"\n"):
-                    termios.tcsetattr(0, termios.TCSADRAIN, saved)
-                    carry_on()                   # only comes back if there's nothing to carry on
-                    tty.setcbreak(0)
-                last = time.time()
-            elif not interactive:
-                time.sleep(0.25)
-            if time.time() - last > Live.IDLE:
-                break
-    except KeyboardInterrupt:
-        pass
-    finally:
-        if saved:
-            termios.tcsetattr(0, termios.TCSADRAIN, saved)
-        try:
-            with open(pidfile) as f:
-                if f.read().strip() == str(os.getpid()):
-                    os.unlink(pidfile)
-        except OSError:
-            pass
-    return 0
-
-
 def main():
     args = sys.argv[1:]
     commands = {"setup": cmd_setup, "run": cmd_run, "send": cmd_send, "claude": cmd_claude,
                 "test": cmd_test, "mode": cmd_mode, "unlock": cmd_unlock, "lockdown": cmd_lockdown,
-                "session": cmd_session, "claude-dir": cmd_claude_dir, "update": cmd_update,
-                "account": cmd_account, "live": cmd_live}
+                "session": cmd_session, "claude-dir": cmd_claude_dir, "update": cmd_update}
     if not args or args[0] not in commands:
         print(__doc__.strip())
         return 0 if not args or args[0] in ("-h", "--help", "help") else 2
